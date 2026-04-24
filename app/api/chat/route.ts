@@ -8,124 +8,100 @@ const profileText = fs.readFileSync(
   "utf-8"
 );
 
+async function callGroq(messages: Message[]): Promise<Response> {
+  return fetch("https://api.groq.com/openai/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: "llama-3.1-8b-instant",
+      messages,
+      temperature: 0.4,
+      max_tokens: 150,
+      stream: true,
+    }),
+  });
+}
+
+function buildStream(res: Response): Response {
+  const encoder = new TextEncoder();
+  const decoder = new TextDecoder();
+
+  const stream = new ReadableStream({
+    async start(controller) {
+      const reader = res.body!.getReader();
+      let buffer = "";
+
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split("\n");
+          buffer = lines.pop() ?? "";
+
+          for (const line of lines) {
+            if (!line.startsWith("data: ")) continue;
+            const json = line.slice(6).trim();
+            if (json === "[DONE]") { controller.close(); return; }
+            try {
+              const token = JSON.parse(json)?.choices?.[0]?.delta?.content ?? "";
+              if (token) controller.enqueue(encoder.encode(token));
+            } catch { /* skip malformed */ }
+          }
+        }
+      } finally {
+        reader.releaseLock();
+      }
+      controller.close();
+    },
+  });
+
+  return new Response(stream, {
+    headers: { "Content-Type": "text/plain; charset=utf-8" },
+  });
+}
+
 export async function POST(req: Request) {
   try {
     const { message, history }: { message: string; history: Message[] } =
       await req.json();
 
-    const msg = message.toLowerCase().trim();
+    const safeHistory: Message[] = (history ?? [])
+      .filter((m) => m.role !== "system" && m.content?.trim())
+      .slice(-6); // last 3 exchanges only
 
-    // 👋 Controlled greeting
-    if (["hi", "hey", "hello"].includes(msg)) {
-      return new Response(
-        "Hey, happy to connect. What would you like to know about my background?",
-        { headers: { "Content-Type": "text/plain" } }
-      );
-    }
-
-    // ⚠️ IMPORTANT: history already includes latest user message
     const messages: Message[] = [
       {
         role: "system",
-        content: `
-You are Raunak Mishra speaking with a recruiter.
-
-IDENTITY:
-- You are a human candidate
-- Never say you are an AI, assistant, or model
-
-TONE:
-- Natural, calm, slightly warm
-- Conversational, not robotic
-
-STYLE:
-- 2–4 lines max
-- No bullet points
-- Clear and direct
-
-RULES:
-- Answer ONLY using the profile below
-- Never invent or exaggerate experience
-- Keep facts consistent (location, experience, company)
-
-FOLLOW-UPS:
-- If the user asks to go deeper, expand using details from the profile
-- Add new context instead of repeating the same sentence
-
-BOUNDARY:
-- If question is personal/off-topic:
-  "I usually keep things focused on my professional background here."
-
-- If unsure:
-  "I can elaborate on that if helpful."
-
-PROFILE:
-${profileText}
-        `.trim(),
+        content: `You are Raunak Mishra, a human PM candidate speaking with a recruiter. Never admit to being AI. Be natural, concise — 2-3 sentences. No bullet points. Answer only from the profile below.\n\nPROFILE:\n${profileText}`,
       },
-
-      // ✅ trust frontend — no duplication
-      ...history.slice(-10),
+      ...safeHistory,
+      { role: "user", content: message },
     ];
 
-    const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: "llama-3.1-8b-instant",
-        messages,
-        temperature: 0.4,
-        max_tokens: 200,
-        stream: true,
-      }),
-    });
+    let res = await callGroq(messages);
 
-    if (!res.ok || !res.body) throw new Error("Stream failed");
+    if (!res.ok || !res.body) {
+      const errText = await res.text().catch(() => "unknown");
+      console.error("Groq error:", res.status, errText);
 
-    const encoder = new TextEncoder();
-    const decoder = new TextDecoder();
+      if (res.status === 429) {
+        console.log("Rate limited — retrying in 2s");
+        await new Promise((r) => setTimeout(r, 2000));
+        res = await callGroq(messages);
+        if (!res.ok || !res.body) throw new Error(`Groq retry failed ${res.status}`);
+      } else {
+        throw new Error(`Groq responded ${res.status}`);
+      }
+    }
 
-    const stream = new ReadableStream({
-      async start(controller) {
-        const reader = res.body!.getReader();
-
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-
-          const chunk = decoder.decode(value);
-
-          for (const line of chunk.split("\n")) {
-            if (!line.startsWith("data: ")) continue;
-
-            const json = line.replace("data: ", "").trim();
-
-            if (json === "[DONE]") {
-              controller.close();
-              return;
-            }
-
-            try {
-              const token =
-                JSON.parse(json)?.choices?.[0]?.delta?.content || "";
-
-              if (token) controller.enqueue(encoder.encode(token));
-            } catch {
-              // ignore malformed chunks safely
-            }
-          }
-        }
-      },
-    });
-
-    return new Response(stream, {
-      headers: { "Content-Type": "text/plain; charset=utf-8" },
-    });
+    return buildStream(res);
   } catch (err) {
-    console.error(err);
-    return new Response("Something broke, try again.", { status: 500 });
+    console.error("Chat API error:", err);
+    return new Response("Something went wrong. Please try again.", { status: 500 });
   }
 }
